@@ -98,10 +98,10 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
                 "space record  d device  q quit"
             }
         }
-        Mode::Recording { .. } => "space stop",
+        Mode::Recording { .. } => "space stop  esc cancel",
         Mode::Transcribing { .. } => "",
-        Mode::Result { copied: true, .. } => "space new  s save  w wav",
-        Mode::Result { .. } => "space new  c copy  s save  w wav",
+        Mode::Result { copied: true, .. } => "space new  r redo  s save  w wav",
+        Mode::Result { .. } => "space new  r redo  c copy  s save  w wav",
         Mode::Error { .. } => "space retry  q quit",
     };
 
@@ -213,6 +213,19 @@ fn draw_result_text(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
+    // Flash message overrides normal status
+    if let Some(flash) = state.active_flash() {
+        let spans = vec![
+            Span::styled(" ✓ ", Style::default().fg(GREEN)),
+            Span::styled(flash, Style::default().fg(Color::Rgb(80, 80, 95))),
+        ];
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
+            area,
+        );
+        return;
+    }
+
     let spans = match &state.mode {
         Mode::Idle => {
             vec![
@@ -255,9 +268,12 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             }
             spans
         }
-        Mode::Transcribing { duration_secs } => {
+        Mode::Transcribing {
+            duration_secs,
+            ref partial_text,
+        } => {
             let spinner = SPINNER[(state.tick / 3) as usize % SPINNER.len()];
-            vec![
+            let mut spans = vec![
                 Span::styled(format!(" {spinner} "), Style::default().fg(BLUE)),
                 Span::styled(
                     "transcribing",
@@ -267,7 +283,15 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
                     format!("  {duration_secs:.1}s"),
                     Style::default().fg(Color::Rgb(70, 70, 85)),
                 ),
-            ]
+            ];
+            if !partial_text.is_empty() {
+                let preview: String = partial_text.chars().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+                spans.push(Span::styled(
+                    format!("  {preview}"),
+                    Style::default().fg(Color::Rgb(90, 90, 105)),
+                ));
+            }
+            spans
         }
         Mode::Result { copied: true, .. } => {
             vec![

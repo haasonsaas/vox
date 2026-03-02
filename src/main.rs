@@ -16,9 +16,10 @@ use crossterm::{
 };
 use error::VoxError;
 use ratatui::prelude::*;
-use std::io;
+use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use transcribe::StreamEvent;
 
 #[derive(Parser)]
 #[command(name = "vox", about = "Beautiful voice-to-text transcription")]
@@ -47,6 +48,10 @@ struct Cli {
     /// Optional context prompt to improve transcription accuracy
     #[arg(long)]
     context: Option<String>,
+
+    /// One-shot mode: record once, print transcription to stdout, exit
+    #[arg(long)]
+    oneshot: bool,
 }
 
 struct ResolvedAuth {
@@ -57,9 +62,39 @@ struct ResolvedAuth {
     source: String,
 }
 
-enum TranscriptionResult {
-    Success { text: String },
-    Error { message: String },
+const HISTORY_FILE: &str = ".vox_history";
+const MAX_HISTORY_ENTRIES: usize = 100;
+
+fn history_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(HISTORY_FILE))
+}
+
+fn load_history() -> Vec<String> {
+    history_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|contents| {
+            contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_history(history: &[String]) {
+    if let Some(path) = history_path() {
+        let entries: Vec<&String> = history.iter().rev().take(MAX_HISTORY_ENTRIES).collect();
+        let text: String = entries
+            .into_iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(path, text + "\n");
+    }
 }
 
 #[tokio::main]
@@ -74,6 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     let auth = resolve_auth(&cli)?;
+
+    // One-shot mode: record, transcribe, print, exit — no TUI
+    if cli.oneshot {
+        return run_oneshot(&cli, &auth).await;
+    }
 
     // Setup terminal
     terminal::enable_raw_mode()?;
@@ -99,12 +139,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     result.map(|_| ())
 }
 
+async fn run_oneshot(
+    cli: &Cli,
+    auth: &ResolvedAuth,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprint!("Recording... press Ctrl+C to stop. ");
+
+    let capture = audio::VoiceCapture::start(None)?;
+
+    // Wait for Ctrl+C
+    tokio::signal::ctrl_c().await?;
+    eprintln!("done.");
+
+    let recorded = capture.stop()?;
+    eprint!("Transcribing... ");
+
+    let text = transcribe::transcribe(
+        recorded,
+        &auth.api_key,
+        &auth.api_base,
+        auth.organization.as_deref(),
+        auth.project.as_deref(),
+        cli.context.as_deref(),
+    )
+    .await?;
+
+    eprintln!("done.");
+
+    if cli.clipboard {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(&text);
+        }
+    }
+
+    io::stdout().write_all(text.as_bytes())?;
+    io::stdout().write_all(b"\n")?;
+    Ok(())
+}
+
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: &Cli,
     auth: &ResolvedAuth,
 ) -> Result<AppState, Box<dyn std::error::Error>> {
     let mut state = AppState::new(auth.source.clone());
+    state.history = load_history();
+
     let mut capture: Option<audio::VoiceCapture> = None;
     let mut record_start: Option<Instant> = None;
     let mut env: f64 = 0.0;
@@ -112,16 +192,25 @@ async fn run_app(
     let tick_rate = Duration::from_millis(TICK_RATE_MS);
     let mut last_tick = Instant::now();
 
-    // Channel for non-blocking transcription results
-    let (tx, mut rx) = mpsc::channel::<TranscriptionResult>(4);
+    // Channel for streaming transcription events
+    let (tx, mut rx) = mpsc::channel::<StreamEvent>(64);
 
     loop {
         terminal.draw(|f| ui::draw(f, &state))?;
 
-        // Check for completed transcriptions (non-blocking)
-        if let Ok(result) = rx.try_recv() {
-            match result {
-                TranscriptionResult::Success { text } => {
+        // Check for streaming transcription events (non-blocking, drain all available)
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Delta(delta) => {
+                    if let Mode::Transcribing {
+                        ref mut partial_text,
+                        ..
+                    } = state.mode
+                    {
+                        partial_text.push_str(&delta);
+                    }
+                }
+                StreamEvent::Done(text) => {
                     let mut copied = false;
                     if cli.clipboard {
                         if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -129,9 +218,10 @@ async fn run_app(
                         }
                     }
                     state.history.push(text.clone());
+                    save_history(&state.history);
                     state.set_mode(Mode::Result { text, copied });
                 }
-                TranscriptionResult::Error { message } => {
+                StreamEvent::Error(message) => {
                     state.set_mode(Mode::Error { message });
                 }
             }
@@ -149,6 +239,13 @@ async fn run_app(
                     // Don't quit if device picker is open
                     if state.show_device_picker {
                         state.show_device_picker = false;
+                        continue;
+                    }
+                    // Don't quit during recording — treat as cancel
+                    if matches!(state.mode, Mode::Recording { .. }) {
+                        drop(capture.take());
+                        record_start = None;
+                        state.set_mode(Mode::Idle);
                         continue;
                     }
                     drop(capture.take());
@@ -182,30 +279,10 @@ async fn run_app(
                 match &state.mode {
                     Mode::Idle => match key.code {
                         KeyCode::Char(' ') => {
-                            let device_name = state
-                                .input_devices
-                                .get(state.selected_device)
-                                .map(|(name, _)| name.as_str());
-                            match audio::VoiceCapture::start(device_name) {
-                                Ok(c) => {
-                                    capture = Some(c);
-                                    record_start = Some(Instant::now());
-                                    env = 0.0;
-                                    state.set_mode(Mode::Recording {
-                                        duration_secs: 0.0,
-                                        energy: 0.0,
-                                    });
-                                }
-                                Err(e) => {
-                                    state.set_mode(Mode::Error {
-                                        message: e.to_string(),
-                                    });
-                                }
-                            }
+                            start_recording(&mut state, &mut capture, &mut record_start, &mut env);
                         }
                         KeyCode::Char('d') => {
                             state.input_devices = audio::list_input_devices();
-                            // Find current default
                             if let Some(pos) = state
                                 .input_devices
                                 .iter()
@@ -245,15 +322,18 @@ async fn run_app(
                             if let Some(i) = state.history_selected {
                                 if let Some(text) = state.history.get(i) {
                                     if let Ok(mut cb) = arboard::Clipboard::new() {
-                                        let _ = cb.set_text(text);
+                                        if cb.set_text(text).is_ok() {
+                                            state.flash("copied".to_string());
+                                        }
                                     }
                                 }
                             }
                         }
                         _ => {}
                     },
-                    Mode::Recording { .. } => {
-                        if key.code == KeyCode::Char(' ') {
+                    Mode::Recording { .. } => match key.code {
+                        KeyCode::Char(' ') => {
+                            // Stop recording and start transcription
                             let recorded = capture
                                 .take()
                                 .ok_or_else(|| {
@@ -263,17 +343,17 @@ async fn run_app(
                             let duration = audio::clip_duration_seconds(&recorded);
                             state.set_mode(Mode::Transcribing {
                                 duration_secs: duration,
+                                partial_text: String::new(),
                             });
                             record_start = None;
 
-                            // Store recording for potential save
                             state.last_recording = Some(audio::RecordedAudio {
                                 data: recorded.data.clone(),
                                 sample_rate: recorded.sample_rate,
                                 channels: recorded.channels,
                             });
 
-                            // Spawn non-blocking transcription task
+                            // Spawn streaming transcription task
                             let tx = tx.clone();
                             let api_key = auth.api_key.clone();
                             let api_base = auth.api_base.clone();
@@ -281,82 +361,107 @@ async fn run_app(
                             let project = auth.project.clone();
                             let context = cli.context.clone();
                             tokio::spawn(async move {
-                                let result = transcribe::transcribe(
+                                transcribe::transcribe_streaming(
                                     recorded,
                                     &api_key,
                                     &api_base,
                                     organization.as_deref(),
                                     project.as_deref(),
                                     context.as_deref(),
+                                    tx,
                                 )
                                 .await;
-                                let msg = match result {
-                                    Ok(text) => TranscriptionResult::Success { text },
-                                    Err(e) => TranscriptionResult::Error {
-                                        message: e.to_string(),
-                                    },
-                                };
-                                let _ = tx.send(msg).await;
                             });
                         }
-                    }
-                    Mode::Transcribing { .. } => {
-                        // Can't interrupt — waveform keeps animating
-                    }
-                    Mode::Result { ref text, .. } => match key.code {
-                        KeyCode::Char(' ') => {
+                        KeyCode::Esc => {
+                            // Cancel recording without transcribing
+                            drop(capture.take());
+                            record_start = None;
                             state.set_mode(Mode::Idle);
                         }
-                        KeyCode::Char('c') | KeyCode::Char('C') => {
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                let _ = cb.set_text(text);
+                        _ => {}
+                    },
+                    Mode::Transcribing { .. } => {
+                        // Waveform keeps animating, can't interrupt
+                    }
+                    Mode::Result { .. } => {
+                        // Clone text out to avoid borrow issues
+                        let text = if let Mode::Result { ref text, .. } = state.mode {
+                            text.clone()
+                        } else {
+                            unreachable!()
+                        };
+                        match key.code {
+                            KeyCode::Char(' ') => {
+                                state.set_mode(Mode::Idle);
                             }
-                            state.set_mode(Mode::Result {
-                                text: text.clone(),
-                                copied: true,
-                            });
-                        }
-                        KeyCode::Char('s') => {
-                            // Save transcript to file
-                            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                            let filename = format!("vox_{ts}.txt");
-                            if let Err(e) = std::fs::write(&filename, text) {
-                                state.set_mode(Mode::Error {
-                                    message: format!("save failed: {e}"),
+                            KeyCode::Char('r') => {
+                                start_recording(
+                                    &mut state,
+                                    &mut capture,
+                                    &mut record_start,
+                                    &mut env,
+                                );
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    if cb.set_text(&text).is_ok() {
+                                        state.flash("copied".to_string());
+                                    }
+                                }
+                                state.set_mode(Mode::Result {
+                                    text,
+                                    copied: true,
                                 });
                             }
-                        }
-                        KeyCode::Char('w') => {
-                            // Save WAV to disk
-                            if let Some(ref recording) = state.last_recording {
+                            KeyCode::Char('s') => {
                                 let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                                let filename = format!("vox_{ts}.wav");
-                                match audio::encode_wav_raw(recording) {
-                                    Ok(wav_bytes) => {
-                                        if let Err(e) = std::fs::write(&filename, wav_bytes) {
-                                            state.set_mode(Mode::Error {
-                                                message: format!("save failed: {e}"),
-                                            });
-                                        }
-                                    }
+                                let filename = format!("vox_{ts}.txt");
+                                match std::fs::write(&filename, &text) {
+                                    Ok(()) => state.flash(format!("saved {filename}")),
                                     Err(e) => {
                                         state.set_mode(Mode::Error {
-                                            message: format!("wav encode failed: {e}"),
+                                            message: format!("save failed: {e}"),
                                         });
                                     }
                                 }
                             }
-                        }
-                        KeyCode::Up => {
-                            if state.result_scroll > 0 {
-                                state.result_scroll -= 1;
+                            KeyCode::Char('w') => {
+                                if let Some(ref recording) = state.last_recording {
+                                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                                    let filename = format!("vox_{ts}.wav");
+                                    match audio::encode_wav_raw(recording) {
+                                        Ok(wav_bytes) => {
+                                            match std::fs::write(&filename, wav_bytes) {
+                                                Ok(()) => {
+                                                    state.flash(format!("saved {filename}"))
+                                                }
+                                                Err(e) => {
+                                                    state.set_mode(Mode::Error {
+                                                        message: format!("save failed: {e}"),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            state.set_mode(Mode::Error {
+                                                message: format!("wav encode failed: {e}"),
+                                            });
+                                        }
+                                    }
+                                }
                             }
+                            KeyCode::Up => {
+                                if state.result_scroll > 0 {
+                                    state.result_scroll -= 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                state.result_scroll = state.result_scroll.saturating_add(1);
+                            }
+                            _ => {}
                         }
-                        KeyCode::Down => {
-                            state.result_scroll += 1;
-                        }
-                        _ => {}
-                    },
+                    }
                     Mode::Error { .. } => {
                         if key.code == KeyCode::Char(' ') {
                             state.set_mode(Mode::Idle);
@@ -389,6 +494,34 @@ async fn run_app(
             }
 
             last_tick = Instant::now();
+        }
+    }
+}
+
+fn start_recording(
+    state: &mut AppState,
+    capture: &mut Option<audio::VoiceCapture>,
+    record_start: &mut Option<Instant>,
+    env: &mut f64,
+) {
+    let device_name = state
+        .input_devices
+        .get(state.selected_device)
+        .map(|(name, _)| name.as_str());
+    match audio::VoiceCapture::start(device_name) {
+        Ok(c) => {
+            *capture = Some(c);
+            *record_start = Some(Instant::now());
+            *env = 0.0;
+            state.set_mode(Mode::Recording {
+                duration_secs: 0.0,
+                energy: 0.0,
+            });
+        }
+        Err(e) => {
+            state.set_mode(Mode::Error {
+                message: e.to_string(),
+            });
         }
     }
 }

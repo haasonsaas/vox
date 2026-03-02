@@ -9,6 +9,7 @@ pub enum Mode {
     },
     Transcribing {
         duration_secs: f32,
+        partial_text: String,
     },
     Result {
         text: String,
@@ -42,7 +43,13 @@ pub struct AppState {
 
     // Last recording for save-to-file
     pub last_recording: Option<RecordedAudio>,
+
+    // Transient flash message (e.g. "saved vox_20260302.txt")
+    pub flash_message: Option<String>,
+    pub flash_tick: u64,
 }
+
+const FLASH_DURATION_TICKS: u64 = 60; // ~2 seconds at 30fps
 
 impl AppState {
     pub fn new(auth_source: String) -> Self {
@@ -58,6 +65,8 @@ impl AppState {
             selected_device: 0,
             show_device_picker: false,
             last_recording: None,
+            flash_message: None,
+            flash_tick: 0,
         }
     }
 
@@ -71,5 +80,21 @@ impl AppState {
     /// How many ticks since the last mode transition.
     pub fn transition_age(&self) -> u64 {
         self.tick.saturating_sub(self.transition_tick)
+    }
+
+    /// Show a transient status message that auto-expires.
+    pub fn flash(&mut self, msg: String) {
+        self.flash_message = Some(msg);
+        self.flash_tick = self.tick;
+    }
+
+    /// Get the current flash message if still active.
+    pub fn active_flash(&self) -> Option<&str> {
+        if let Some(ref msg) = self.flash_message {
+            if self.tick.saturating_sub(self.flash_tick) < FLASH_DURATION_TICKS {
+                return Some(msg);
+            }
+        }
+        None
     }
 }
