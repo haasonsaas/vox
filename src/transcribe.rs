@@ -183,6 +183,7 @@ pub async fn transcribe(
     api_base: &str,
     organization: Option<&str>,
     project: Option<&str>,
+    account_id: Option<&str>,
     context: Option<&str>,
 ) -> Result<String, VoxError> {
     let duration_seconds = audio::clip_duration_seconds(&audio);
@@ -221,6 +222,9 @@ pub async fn transcribe(
     }
     if let Some(proj) = project {
         req = req.header("OpenAI-Project", proj);
+    }
+    if let Some(acct) = account_id {
+        req = req.header("chatgpt-account-id", acct);
     }
 
     let resp = req

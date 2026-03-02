@@ -59,6 +59,8 @@ struct ResolvedAuth {
     api_base: String,
     organization: Option<String>,
     project: Option<String>,
+    /// ChatGPT OAuth account ID (sent as chatgpt-account-id header)
+    account_id: Option<String>,
     source: String,
 }
 
@@ -160,6 +162,7 @@ async fn run_oneshot(
         &auth.api_base,
         auth.organization.as_deref(),
         auth.project.as_deref(),
+        auth.account_id.as_deref(),
         cli.context.as_deref(),
     )
     .await?;
@@ -359,15 +362,16 @@ async fn run_app(
                             let api_base = auth.api_base.clone();
                             let organization = auth.organization.clone();
                             let project = auth.project.clone();
+                            let account_id = auth.account_id.clone();
                             let context = cli.context.clone();
                             tokio::spawn(async move {
-                                // Use non-streaming transcription (reliable)
                                 let result = transcribe::transcribe(
                                     recorded,
                                     &api_key,
                                     &api_base,
                                     organization.as_deref(),
                                     project.as_deref(),
+                                    account_id.as_deref(),
                                     context.as_deref(),
                                 )
                                 .await;
@@ -534,16 +538,24 @@ fn start_recording(
 // ─── Auth resolution ────────────────────────────────────────
 
 fn resolve_auth(cli: &Cli) -> Result<ResolvedAuth, VoxError> {
-    let (api_key, source) = if let Some(ref key) = cli.api_key {
-        (key.clone(), "--api-key".to_string())
+    // Auth resolution order:
+    //   1. --api-key flag
+    //   2. CODEX_API_KEY env var
+    //   3. OPENAI_API_KEY env var
+    //   4. ~/.codex/auth.json → OPENAI_API_KEY field (auth_mode: "apikey")
+    //   5. ~/.codex/auth.json → tokens.access_token (auth_mode: "chatgpt")
+    let auth_json = read_codex_auth_json();
+
+    let (api_key, account_id, source) = if let Some(ref key) = cli.api_key {
+        (key.clone(), None, "--api-key".to_string())
     } else if let Ok(key) = std::env::var("CODEX_API_KEY") {
         if !key.is_empty() {
-            (key, "CODEX_API_KEY".to_string())
+            (key, None, "CODEX_API_KEY".to_string())
         } else {
-            try_openai_key_or_auth_json()?
+            try_resolve_key(&auth_json)?
         }
     } else {
-        try_openai_key_or_auth_json()?
+        try_resolve_key(&auth_json)?
     };
 
     let api_base = cli
@@ -567,28 +579,67 @@ fn resolve_auth(cli: &Cli) -> Result<ResolvedAuth, VoxError> {
         api_base,
         organization,
         project,
+        account_id,
         source,
     })
 }
 
-fn try_openai_key_or_auth_json() -> Result<(String, String), VoxError> {
+/// Read and parse ~/.codex/auth.json if it exists.
+fn read_codex_auth_json() -> Option<serde_json::Value> {
+    let home = std::env::var("HOME").ok()?;
+    let auth_file = std::path::PathBuf::from(home).join(".codex").join("auth.json");
+    let contents = std::fs::read_to_string(auth_file).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Try env vars and auth.json to find a usable API key/token.
+/// Returns (key, optional_account_id, source_description).
+fn try_resolve_key(
+    auth_json: &Option<serde_json::Value>,
+) -> Result<(String, Option<String>, String), VoxError> {
+    // OPENAI_API_KEY env var
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         if !key.is_empty() {
-            return Ok((key, "OPENAI_API_KEY".to_string()));
+            return Ok((key, None, "OPENAI_API_KEY".to_string()));
         }
     }
 
-    if let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
-        let auth_file = home.join(".codex").join("auth.json");
-        if auth_file.exists() {
-            let contents = std::fs::read_to_string(&auth_file)
-                .map_err(|e| VoxError::Terminal(e.to_string()))?;
-            let v: serde_json::Value = serde_json::from_str(&contents)
-                .map_err(|e| VoxError::Terminal(e.to_string()))?;
+    // ~/.codex/auth.json
+    if let Some(v) = auth_json {
+        let auth_mode = v.get("auth_mode").and_then(|m| m.as_str()).unwrap_or("");
+
+        // API key mode: OPENAI_API_KEY field is set
+        if auth_mode == "apikey" {
             if let Some(key) = v.get("OPENAI_API_KEY").and_then(|k| k.as_str()) {
                 if !key.is_empty() {
-                    return Ok((key.to_string(), format!("{}", auth_file.display())));
+                    return Ok((key.to_string(), None, "codex (api key)".to_string()));
                 }
+            }
+        }
+
+        // ChatGPT OAuth mode: use tokens.access_token
+        if auth_mode == "chatgpt" {
+            if let Some(tokens) = v.get("tokens") {
+                if let Some(access_token) = tokens.get("access_token").and_then(|t| t.as_str()) {
+                    if !access_token.is_empty() {
+                        let account_id = tokens
+                            .get("account_id")
+                            .and_then(|a| a.as_str())
+                            .map(String::from);
+                        return Ok((
+                            access_token.to_string(),
+                            account_id,
+                            "codex (chatgpt)".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Fallback: try OPENAI_API_KEY regardless of auth_mode
+        if let Some(key) = v.get("OPENAI_API_KEY").and_then(|k| k.as_str()) {
+            if !key.is_empty() {
+                return Ok((key.to_string(), None, "codex auth.json".to_string()));
             }
         }
     }
