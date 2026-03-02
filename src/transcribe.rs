@@ -3,6 +3,7 @@ use crate::constants::{AUDIO_MODEL, MIN_DURATION_SECONDS};
 use crate::error::VoxError;
 use tokio::sync::mpsc;
 
+#[allow(dead_code)]
 pub enum StreamEvent {
     /// Incremental text fragment
     Delta(String),
@@ -13,6 +14,7 @@ pub enum StreamEvent {
 }
 
 /// Streaming transcription — sends Delta events as text arrives, then Done.
+#[allow(dead_code)]
 pub async fn transcribe_streaming(
     audio: RecordedAudio,
     api_key: &str,
@@ -115,35 +117,18 @@ async fn transcribe_streaming_inner(
     {
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete SSE lines
-        while let Some(pos) = buffer.find("\n\n") {
-            let event_block = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
-
-            // Extract the data line
-            for line in event_block.lines() {
-                let line = line.trim();
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                        match v.get("type").and_then(|t| t.as_str()) {
-                            Some("transcript.text.delta") => {
-                                if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                                    full_text.push_str(delta);
-                                    let _ = tx.send(StreamEvent::Delta(delta.to_string())).await;
-                                }
-                            }
-                            Some("transcript.text.done") => {
-                                if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                                    full_text = text.to_string();
-                                }
-                                // Done event received
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+        // Normalize \r\n to \n for SSE parsing
+        if buffer.contains('\r') {
+            buffer = buffer.replace("\r\n", "\n");
         }
+
+        process_sse_buffer(&mut buffer, &mut full_text, tx).await;
+    }
+
+    // Process any remaining data in the buffer (final event may lack trailing \n\n)
+    if !buffer.trim().is_empty() {
+        buffer.push_str("\n\n");
+        process_sse_buffer(&mut buffer, &mut full_text, tx).await;
     }
 
     if full_text.is_empty() {
@@ -152,6 +137,43 @@ async fn transcribe_streaming_inner(
 
     let _ = tx.send(StreamEvent::Done(full_text)).await;
     Ok(())
+}
+
+async fn process_sse_buffer(
+    buffer: &mut String,
+    full_text: &mut String,
+    tx: &mpsc::Sender<StreamEvent>,
+) {
+    while let Some(pos) = buffer.find("\n\n") {
+        let event_block = buffer[..pos].to_string();
+        *buffer = buffer[pos + 2..].to_string();
+
+        for line in event_block.lines() {
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data: ") {
+                // Skip [DONE] sentinel
+                if data.trim() == "[DONE]" {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    match v.get("type").and_then(|t| t.as_str()) {
+                        Some("transcript.text.delta") => {
+                            if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
+                                full_text.push_str(delta);
+                                let _ = tx.send(StreamEvent::Delta(delta.to_string())).await;
+                            }
+                        }
+                        Some("transcript.text.done") => {
+                            if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                                *full_text = text.to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Non-streaming transcription (for --oneshot mode).

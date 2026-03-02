@@ -353,7 +353,7 @@ async fn run_app(
                                 channels: recorded.channels,
                             });
 
-                            // Spawn streaming transcription task
+                            // Spawn non-blocking transcription task
                             let tx = tx.clone();
                             let api_key = auth.api_key.clone();
                             let api_base = auth.api_base.clone();
@@ -361,16 +361,21 @@ async fn run_app(
                             let project = auth.project.clone();
                             let context = cli.context.clone();
                             tokio::spawn(async move {
-                                transcribe::transcribe_streaming(
+                                // Use non-streaming transcription (reliable)
+                                let result = transcribe::transcribe(
                                     recorded,
                                     &api_key,
                                     &api_base,
                                     organization.as_deref(),
                                     project.as_deref(),
                                     context.as_deref(),
-                                    tx,
                                 )
                                 .await;
+                                let event = match result {
+                                    Ok(text) => StreamEvent::Done(text),
+                                    Err(e) => StreamEvent::Error(e.to_string()),
+                                };
+                                let _ = tx.send(event).await;
                             });
                         }
                         KeyCode::Esc => {
