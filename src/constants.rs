@@ -28,7 +28,7 @@ pub const TRANSITION_PULSE_TICKS: u64 = 3;
 
 // ─── Audio model ──────────────────────────────────────────
 pub const MIN_DURATION_SECONDS: f32 = 1.0;
-pub const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
+pub const AUDIO_MODEL: &str = "gpt-4o-transcribe";
 
 // ─── Color palette ────────────────────────────────────────
 pub mod colors {
