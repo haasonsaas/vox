@@ -1,7 +1,6 @@
 use crate::audio::{self, RecordedAudio};
-
-const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
-const MIN_DURATION_SECONDS: f32 = 1.0;
+use crate::constants::{AUDIO_MODEL, MIN_DURATION_SECONDS};
+use crate::error::VoxError;
 
 pub async fn transcribe(
     audio: RecordedAudio,
@@ -10,26 +9,22 @@ pub async fn transcribe(
     organization: Option<&str>,
     project: Option<&str>,
     context: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, VoxError> {
     let duration_seconds = audio::clip_duration_seconds(&audio);
     if duration_seconds < MIN_DURATION_SECONDS {
-        return Err(format!(
-            "recording too short ({duration_seconds:.2}s); minimum is {MIN_DURATION_SECONDS:.2}s"
-        ));
+        return Err(VoxError::RecordingTooShort {
+            duration: duration_seconds,
+            min: MIN_DURATION_SECONDS,
+        });
     }
 
     let wav_bytes = audio::encode_wav_normalized(&audio)?;
-    let audio_kib = wav_bytes.len() as f32 / 1024.0;
-
-    eprintln!(
-        "  sending {audio_kib:.1} KiB ({duration_seconds:.1}s) to {AUDIO_MODEL}..."
-    );
 
     let client = reqwest::Client::new();
     let part = reqwest::multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
         .mime_str("audio/wav")
-        .map_err(|e| format!("failed to set mime: {e}"))?;
+        .map_err(|e| VoxError::TranscriptionRequest(format!("failed to set mime: {e}")))?;
 
     let mut form = reqwest::multipart::Form::new()
         .text("model", AUDIO_MODEL)
@@ -57,7 +52,7 @@ pub async fn transcribe(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("transcription request failed: {e}"))?;
+        .map_err(|e| VoxError::TranscriptionRequest(e.to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -65,13 +60,16 @@ pub async fn transcribe(
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read body>".to_string());
-        return Err(format!("transcription failed: {status} {body}"));
+        return Err(VoxError::TranscriptionApi {
+            status: status.to_string(),
+            body,
+        });
     }
 
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("failed to parse json: {e}"))?;
+        .map_err(|e| VoxError::TranscriptionRequest(format!("failed to parse json: {e}")))?;
 
     let text = v
         .get("text")
@@ -80,7 +78,7 @@ pub async fn transcribe(
         .to_string();
 
     if text.is_empty() {
-        Err("empty transcription result".to_string())
+        Err(VoxError::EmptyTranscription)
     } else {
         Ok(text)
     }

@@ -1,20 +1,24 @@
 mod app;
 mod audio;
+mod constants;
+mod error;
 mod transcribe;
 mod ui;
 mod waveform;
 
-use app::AppState;
+use app::{AppState, Mode};
 use clap::Parser;
+use constants::*;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use error::VoxError;
 use ratatui::prelude::*;
 use std::io;
 use std::time::{Duration, Instant};
-use ui::Mode;
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(name = "vox", about = "Beautiful voice-to-text transcription")]
@@ -53,7 +57,21 @@ struct ResolvedAuth {
     source: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+enum TranscriptionResult {
+    Success { text: String },
+    Error { message: String },
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install panic hook to restore terminal on panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
     let cli = Cli::parse();
     let auth = resolve_auth(&cli)?;
 
@@ -64,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, &cli, &auth);
+    let result = run_app(&mut terminal, &cli, &auth).await;
 
     // Restore terminal
     terminal::disable_raw_mode()?;
@@ -81,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result.map(|_| ())
 }
 
-fn run_app(
+async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: &Cli,
     auth: &ResolvedAuth,
@@ -89,13 +107,35 @@ fn run_app(
     let mut state = AppState::new(auth.source.clone());
     let mut capture: Option<audio::VoiceCapture> = None;
     let mut record_start: Option<Instant> = None;
-    let mut env: f64 = 0.0; // envelope follower for waveform energy
+    let mut env: f64 = 0.0;
 
-    let tick_rate = Duration::from_millis(33); // ~30fps
+    let tick_rate = Duration::from_millis(TICK_RATE_MS);
     let mut last_tick = Instant::now();
+
+    // Channel for non-blocking transcription results
+    let (tx, mut rx) = mpsc::channel::<TranscriptionResult>(4);
 
     loop {
         terminal.draw(|f| ui::draw(f, &state))?;
+
+        // Check for completed transcriptions (non-blocking)
+        if let Ok(result) = rx.try_recv() {
+            match result {
+                TranscriptionResult::Success { text } => {
+                    let mut copied = false;
+                    if cli.clipboard {
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            copied = cb.set_text(&text).is_ok();
+                        }
+                    }
+                    state.history.push(text.clone());
+                    state.set_mode(Mode::Result { text, copied });
+                }
+                TranscriptionResult::Error { message } => {
+                    state.set_mode(Mode::Error { message });
+                }
+            }
+        }
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -106,92 +146,220 @@ fn run_app(
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c'))
                 {
-                    // Drop capture cleanly
+                    // Don't quit if device picker is open
+                    if state.show_device_picker {
+                        state.show_device_picker = false;
+                        continue;
+                    }
                     drop(capture.take());
                     return Ok(state);
                 }
 
+                // Device picker overlay takes priority
+                if state.show_device_picker {
+                    match key.code {
+                        KeyCode::Up => {
+                            if state.selected_device > 0 {
+                                state.selected_device -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if state.selected_device + 1 < state.input_devices.len() {
+                                state.selected_device += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            state.show_device_picker = false;
+                        }
+                        KeyCode::Esc => {
+                            state.show_device_picker = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match &state.mode {
-                    Mode::Idle => {
-                        if key.code == KeyCode::Char(' ') {
-                            match audio::VoiceCapture::start() {
+                    Mode::Idle => match key.code {
+                        KeyCode::Char(' ') => {
+                            let device_name = state
+                                .input_devices
+                                .get(state.selected_device)
+                                .map(|(name, _)| name.as_str());
+                            match audio::VoiceCapture::start(device_name) {
                                 Ok(c) => {
                                     capture = Some(c);
                                     record_start = Some(Instant::now());
                                     env = 0.0;
-                                    state.mode = Mode::Recording {
+                                    state.set_mode(Mode::Recording {
                                         duration_secs: 0.0,
                                         energy: 0.0,
-                                    };
+                                    });
                                 }
                                 Err(e) => {
-                                    state.mode = Mode::Error {
-                                        message: e,
-                                    };
+                                    state.set_mode(Mode::Error {
+                                        message: e.to_string(),
+                                    });
                                 }
                             }
                         }
-                    }
+                        KeyCode::Char('d') => {
+                            state.input_devices = audio::list_input_devices();
+                            // Find current default
+                            if let Some(pos) = state
+                                .input_devices
+                                .iter()
+                                .position(|(_, is_default)| *is_default)
+                            {
+                                state.selected_device = pos;
+                            }
+                            state.show_device_picker = true;
+                        }
+                        KeyCode::Up => {
+                            if !state.history.is_empty() {
+                                match state.history_selected {
+                                    None => {
+                                        state.history_selected =
+                                            Some(state.history.len() - 1);
+                                    }
+                                    Some(i) if i > 0 => {
+                                        state.history_selected = Some(i - 1);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(i) = state.history_selected {
+                                if i + 1 < state.history.len() {
+                                    state.history_selected = Some(i + 1);
+                                } else {
+                                    state.history_selected = None;
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            state.history_selected = None;
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Enter => {
+                            if let Some(i) = state.history_selected {
+                                if let Some(text) = state.history.get(i) {
+                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                        let _ = cb.set_text(text);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     Mode::Recording { .. } => {
                         if key.code == KeyCode::Char(' ') {
                             let recorded = capture
                                 .take()
-                                .ok_or("no capture")?
+                                .ok_or_else(|| {
+                                    VoxError::Audio("no capture in progress".to_string())
+                                })?
                                 .stop()?;
                             let duration = audio::clip_duration_seconds(&recorded);
-                            state.mode = Mode::Transcribing {
+                            state.set_mode(Mode::Transcribing {
                                 duration_secs: duration,
-                            };
+                            });
                             record_start = None;
 
-                            // Run transcription (blocking for simplicity)
-                            let rt = tokio::runtime::Runtime::new()?;
-                            let result = rt.block_on(transcribe::transcribe(
-                                recorded,
-                                &auth.api_key,
-                                &auth.api_base,
-                                auth.organization.as_deref(),
-                                auth.project.as_deref(),
-                                cli.context.as_deref(),
-                            ));
+                            // Store recording for potential save
+                            state.last_recording = Some(audio::RecordedAudio {
+                                data: recorded.data.clone(),
+                                sample_rate: recorded.sample_rate,
+                                channels: recorded.channels,
+                            });
 
-                            match result {
-                                Ok(text) => {
-                                    let mut copied = false;
-                                    if cli.clipboard {
-                                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                                            copied = cb.set_text(&text).is_ok();
-                                        }
-                                    }
-                                    state.history.push(text.clone());
-                                    state.mode = Mode::Result { text, copied };
-                                }
-                                Err(e) => {
-                                    state.mode = Mode::Error { message: e };
-                                }
-                            }
+                            // Spawn non-blocking transcription task
+                            let tx = tx.clone();
+                            let api_key = auth.api_key.clone();
+                            let api_base = auth.api_base.clone();
+                            let organization = auth.organization.clone();
+                            let project = auth.project.clone();
+                            let context = cli.context.clone();
+                            tokio::spawn(async move {
+                                let result = transcribe::transcribe(
+                                    recorded,
+                                    &api_key,
+                                    &api_base,
+                                    organization.as_deref(),
+                                    project.as_deref(),
+                                    context.as_deref(),
+                                )
+                                .await;
+                                let msg = match result {
+                                    Ok(text) => TranscriptionResult::Success { text },
+                                    Err(e) => TranscriptionResult::Error {
+                                        message: e.to_string(),
+                                    },
+                                };
+                                let _ = tx.send(msg).await;
+                            });
                         }
                     }
                     Mode::Transcribing { .. } => {
-                        // Can't interrupt transcription
+                        // Can't interrupt — waveform keeps animating
                     }
-                    Mode::Result { ref text, .. } => {
-                        if key.code == KeyCode::Char(' ') {
-                            state.mode = Mode::Idle;
-                        } else if key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C')
-                        {
+                    Mode::Result { ref text, .. } => match key.code {
+                        KeyCode::Char(' ') => {
+                            state.set_mode(Mode::Idle);
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 let _ = cb.set_text(text);
                             }
-                            state.mode = Mode::Result {
+                            state.set_mode(Mode::Result {
                                 text: text.clone(),
                                 copied: true,
-                            };
+                            });
                         }
-                    }
+                        KeyCode::Char('s') => {
+                            // Save transcript to file
+                            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                            let filename = format!("vox_{ts}.txt");
+                            if let Err(e) = std::fs::write(&filename, text) {
+                                state.set_mode(Mode::Error {
+                                    message: format!("save failed: {e}"),
+                                });
+                            }
+                        }
+                        KeyCode::Char('w') => {
+                            // Save WAV to disk
+                            if let Some(ref recording) = state.last_recording {
+                                let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                                let filename = format!("vox_{ts}.wav");
+                                match audio::encode_wav_raw(recording) {
+                                    Ok(wav_bytes) => {
+                                        if let Err(e) = std::fs::write(&filename, wav_bytes) {
+                                            state.set_mode(Mode::Error {
+                                                message: format!("save failed: {e}"),
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        state.set_mode(Mode::Error {
+                                            message: format!("wav encode failed: {e}"),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Up => {
+                            if state.result_scroll > 0 {
+                                state.result_scroll -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            state.result_scroll += 1;
+                        }
+                        _ => {}
+                    },
                     Mode::Error { .. } => {
                         if key.code == KeyCode::Char(' ') {
-                            state.mode = Mode::Idle;
+                            state.set_mode(Mode::Idle);
                         }
                     }
                 }
@@ -207,11 +375,10 @@ fn run_app(
                     let duration = start.elapsed().as_secs_f32();
                     let peak = cap.last_peak() as f64 / i16::MAX as f64;
 
-                    // Envelope follower (same as Lark's energy system)
                     if peak > env {
-                        env = 0.8 * peak + 0.2 * env;
+                        env = ENVELOPE_ATTACK_WEIGHT * peak + ENVELOPE_ATTACK_CARRY * env;
                     } else {
-                        env = 0.08 * peak + 0.92 * env;
+                        env = ENVELOPE_DECAY_WEIGHT * peak + ENVELOPE_DECAY_CARRY * env;
                     }
 
                     state.mode = Mode::Recording {
@@ -228,7 +395,7 @@ fn run_app(
 
 // ─── Auth resolution ────────────────────────────────────────
 
-fn resolve_auth(cli: &Cli) -> Result<ResolvedAuth, Box<dyn std::error::Error>> {
+fn resolve_auth(cli: &Cli) -> Result<ResolvedAuth, VoxError> {
     let (api_key, source) = if let Some(ref key) = cli.api_key {
         (key.clone(), "--api-key".to_string())
     } else if let Ok(key) = std::env::var("CODEX_API_KEY") {
@@ -266,7 +433,7 @@ fn resolve_auth(cli: &Cli) -> Result<ResolvedAuth, Box<dyn std::error::Error>> {
     })
 }
 
-fn try_openai_key_or_auth_json() -> Result<(String, String), Box<dyn std::error::Error>> {
+fn try_openai_key_or_auth_json() -> Result<(String, String), VoxError> {
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         if !key.is_empty() {
             return Ok((key, "OPENAI_API_KEY".to_string()));
@@ -276,8 +443,10 @@ fn try_openai_key_or_auth_json() -> Result<(String, String), Box<dyn std::error:
     if let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
         let auth_file = home.join(".codex").join("auth.json");
         if auth_file.exists() {
-            let contents = std::fs::read_to_string(&auth_file)?;
-            let v: serde_json::Value = serde_json::from_str(&contents)?;
+            let contents = std::fs::read_to_string(&auth_file)
+                .map_err(|e| VoxError::Terminal(e.to_string()))?;
+            let v: serde_json::Value = serde_json::from_str(&contents)
+                .map_err(|e| VoxError::Terminal(e.to_string()))?;
             if let Some(key) = v.get("OPENAI_API_KEY").and_then(|k| k.as_str()) {
                 if !key.is_empty() {
                     return Ok((key.to_string(), format!("{}", auth_file.display())));
@@ -286,6 +455,5 @@ fn try_openai_key_or_auth_json() -> Result<(String, String), Box<dyn std::error:
         }
     }
 
-    Err("no API key found. Set OPENAI_API_KEY, CODEX_API_KEY, use --api-key, or run `codex login`"
-        .into())
+    Err(VoxError::NoApiKey)
 }

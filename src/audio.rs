@@ -4,6 +4,8 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::error::VoxError;
+
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
 
@@ -22,12 +24,37 @@ pub struct VoiceCapture {
     last_peak: Arc<AtomicU16>,
 }
 
+/// List available input devices. Returns `(name, is_default)` pairs.
+pub fn list_input_devices() -> Vec<(String, bool)> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.name().ok());
+
+    let mut devices = Vec::new();
+    if let Ok(input_devices) = host.input_devices() {
+        for dev in input_devices {
+            if let Ok(name) = dev.name() {
+                let is_default = default_name.as_deref() == Some(&name);
+                devices.push((name, is_default));
+            }
+        }
+    }
+    devices
+}
+
 impl VoiceCapture {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(device_name: Option<&str>) -> Result<Self, VoxError> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| "no input audio device available".to_string())?;
+        let device = if let Some(name) = device_name {
+            host.input_devices()
+                .map_err(|e| VoxError::Audio(format!("failed to enumerate devices: {e}")))?
+                .find(|d| d.name().ok().as_deref() == Some(name))
+                .ok_or(VoxError::NoInputDevice)?
+        } else {
+            host.default_input_device()
+                .ok_or(VoxError::NoInputDevice)?
+        };
 
         let config = preferred_input_config(&device)?;
         let sample_rate = config.sample_rate().0;
@@ -39,7 +66,7 @@ impl VoiceCapture {
         let stream = build_input_stream(&device, &config, data.clone(), last_peak.clone())?;
         stream
             .play()
-            .map_err(|e| format!("failed to start input stream: {e}"))?;
+            .map_err(|e| VoxError::Audio(format!("failed to start input stream: {e}")))?;
 
         Ok(Self {
             stream: Some(stream),
@@ -51,13 +78,13 @@ impl VoiceCapture {
         })
     }
 
-    pub fn stop(mut self) -> Result<RecordedAudio, String> {
+    pub fn stop(mut self) -> Result<RecordedAudio, VoxError> {
         self.stopped.store(true, Ordering::SeqCst);
         self.stream.take();
         let data = self
             .data
             .lock()
-            .map_err(|_| "failed to lock audio buffer".to_string())?
+            .map_err(|_| VoxError::Audio("failed to lock audio buffer".to_string()))?
             .clone();
         Ok(RecordedAudio {
             data,
@@ -69,15 +96,14 @@ impl VoiceCapture {
     pub fn last_peak(&self) -> u16 {
         self.last_peak.load(Ordering::Relaxed)
     }
-
 }
 
 fn preferred_input_config(
     device: &cpal::Device,
-) -> Result<cpal::SupportedStreamConfig, String> {
+) -> Result<cpal::SupportedStreamConfig, VoxError> {
     let supported_configs = device
         .supported_input_configs()
-        .map_err(|err| format!("failed to enumerate input audio configs: {err}"))?;
+        .map_err(|e| VoxError::Audio(format!("failed to enumerate input audio configs: {e}")))?;
 
     supported_configs
         .filter_map(|range| {
@@ -98,7 +124,7 @@ fn preferred_input_config(
         .min_by_key(|(score, _)| *score)
         .map(|(_, config)| config)
         .or_else(|| device.default_input_config().ok())
-        .ok_or_else(|| "failed to get default input config".to_string())
+        .ok_or_else(|| VoxError::Audio("failed to get default input config".to_string()))
 }
 
 fn preferred_sample_rate(range: &cpal::SupportedStreamConfigRange) -> cpal::SampleRate {
@@ -118,7 +144,7 @@ fn build_input_stream(
     config: &cpal::SupportedStreamConfig,
     data: Arc<Mutex<Vec<i16>>>,
     last_peak: Arc<AtomicU16>,
-) -> Result<cpal::Stream, String> {
+) -> Result<cpal::Stream, VoxError> {
     match config.sample_format() {
         cpal::SampleFormat::F32 => device
             .build_input_stream(
@@ -135,7 +161,7 @@ fn build_input_stream(
                 move |err| eprintln!("audio input error: {err}"),
                 None,
             )
-            .map_err(|e| format!("failed to build input stream: {e}")),
+            .map_err(|e| VoxError::Audio(format!("failed to build input stream: {e}"))),
         cpal::SampleFormat::I16 => device
             .build_input_stream(
                 &config.clone().into(),
@@ -149,7 +175,7 @@ fn build_input_stream(
                 move |err| eprintln!("audio input error: {err}"),
                 None,
             )
-            .map_err(|e| format!("failed to build input stream: {e}")),
+            .map_err(|e| VoxError::Audio(format!("failed to build input stream: {e}"))),
         cpal::SampleFormat::U16 => device
             .build_input_stream(
                 &config.clone().into(),
@@ -162,8 +188,8 @@ fn build_input_stream(
                 move |err| eprintln!("audio input error: {err}"),
                 None,
             )
-            .map_err(|e| format!("failed to build input stream: {e}")),
-        _ => Err("unsupported input sample format".to_string()),
+            .map_err(|e| VoxError::Audio(format!("failed to build input stream: {e}"))),
+        _ => Err(VoxError::Audio("unsupported input sample format".to_string())),
     }
 }
 
@@ -270,7 +296,7 @@ pub fn clip_duration_seconds(audio: &RecordedAudio) -> f32 {
     }
 }
 
-pub fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
+pub fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, VoxError> {
     let converted;
     let (channels, sample_rate, segment) =
         if audio.channels == MODEL_AUDIO_CHANNELS && audio.sample_rate == MODEL_AUDIO_SAMPLE_RATE {
@@ -299,7 +325,7 @@ pub fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
     };
     let mut cursor = Cursor::new(&mut wav_bytes);
     let mut writer =
-        WavWriter::new(&mut cursor, spec).map_err(|_| "failed to create wav writer".to_string())?;
+        WavWriter::new(&mut cursor, spec).map_err(|e| VoxError::WavEncode(e.to_string()))?;
 
     // Peak normalization with headroom
     let mut peak: i16 = 0;
@@ -323,10 +349,34 @@ pub fn encode_wav_normalized(audio: &RecordedAudio) -> Result<Vec<u8>, String> {
             .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         writer
             .write_sample(v)
-            .map_err(|_| "failed writing wav sample".to_string())?;
+            .map_err(|e| VoxError::WavEncode(e.to_string()))?;
     }
     writer
         .finalize()
-        .map_err(|_| "failed to finalize wav".to_string())?;
+        .map_err(|e| VoxError::WavEncode(e.to_string()))?;
+    Ok(wav_bytes)
+}
+
+/// Encode raw PCM to WAV bytes without normalization (for saving to disk).
+pub fn encode_wav_raw(audio: &RecordedAudio) -> Result<Vec<u8>, VoxError> {
+    let mut wav_bytes: Vec<u8> = Vec::new();
+    let spec = WavSpec {
+        channels: audio.channels,
+        sample_rate: audio.sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(&mut wav_bytes);
+    let mut writer =
+        WavWriter::new(&mut cursor, spec).map_err(|e| VoxError::WavEncode(e.to_string()))?;
+
+    for &s in &audio.data {
+        writer
+            .write_sample(s)
+            .map_err(|e| VoxError::WavEncode(e.to_string()))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| VoxError::WavEncode(e.to_string()))?;
     Ok(wav_bytes)
 }
