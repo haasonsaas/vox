@@ -14,18 +14,27 @@ pub enum StreamEvent {
 }
 
 /// Streaming transcription — sends Delta events as text arrives, then Done.
-#[allow(dead_code)]
 pub async fn transcribe_streaming(
     audio: RecordedAudio,
     api_key: &str,
     api_base: &str,
     organization: Option<&str>,
     project: Option<&str>,
+    account_id: Option<&str>,
     context: Option<&str>,
     tx: mpsc::Sender<StreamEvent>,
 ) {
-    match transcribe_streaming_inner(audio, api_key, api_base, organization, project, context, &tx)
-        .await
+    match transcribe_streaming_inner(
+        audio,
+        api_key,
+        api_base,
+        organization,
+        project,
+        account_id,
+        context,
+        &tx,
+    )
+    .await
     {
         Ok(()) => {}
         Err(e) => {
@@ -40,6 +49,7 @@ async fn transcribe_streaming_inner(
     api_base: &str,
     organization: Option<&str>,
     project: Option<&str>,
+    account_id: Option<&str>,
     context: Option<&str>,
     tx: &mpsc::Sender<StreamEvent>,
 ) -> Result<(), VoxError> {
@@ -80,6 +90,9 @@ async fn transcribe_streaming_inner(
     }
     if let Some(proj) = project {
         req = req.header("OpenAI-Project", proj);
+    }
+    if let Some(acct) = account_id {
+        req = req.header("chatgpt-account-id", acct);
     }
 
     let mut resp = req

@@ -230,6 +230,37 @@ impl Widget for &Waveform {
             canvas.plot_curve(px as f64, py, dim_color(color, 0.25), 0.3, glow_thickness);
         }
 
+        // Sparkle particles at wave peaks when energy is high
+        if self.energy > 0.15 {
+            let spark_intensity = ((self.energy - 0.15) / 0.85).min(1.0);
+            // Use tick as seed for deterministic but changing sparkle positions
+            let seed = self.tick;
+            for i in 0..((spark_intensity * 18.0) as u64) {
+                // Simple hash for pseudo-random placement
+                let h = seed.wrapping_mul(2654435761).wrapping_add(i.wrapping_mul(40503));
+                let norm_x = (h % 1000) as f64 / 1000.0;
+                let px = norm_x * canvas.px_w as f64;
+
+                // Place sparkle on the primary wave curve + small offset
+                let y = wave_y(norm_x, self.t, primary, self.energy);
+                let offset = ((h / 1000 % 200) as f64 - 100.0) / 100.0 * 3.0;
+                let py = mid_y - y * amp + offset;
+
+                // Sparkle lifecycle: bright flash then fade
+                let life = ((h / 200000 % 8) as f64) / 8.0;
+                let brightness = (1.0 - life) * spark_intensity;
+
+                if brightness > 0.05 {
+                    let spark_color = lerp_color(
+                        Color::Rgb(180, 220, 255),
+                        Color::Rgb(255, 255, 255),
+                        brightness,
+                    );
+                    canvas.plot_curve(px, py, spark_color, brightness * 0.8, 0.6);
+                }
+            }
+        }
+
         canvas.render_to(area, buf, 0.08);
     }
 }
@@ -240,6 +271,8 @@ pub struct TranscribingWave {
     pub t: f64,
     pub tick: u64,
     pub pulse_boost: f64,
+    pub morph_from_energy: f64,
+    pub morph_progress: f64, // 0.0 = recording style, 1.0 = transcribing style
 }
 
 impl Widget for &TranscribingWave {
@@ -251,55 +284,89 @@ impl Widget for &TranscribingWave {
         let mut canvas = BrailleCanvas::new(area.width as usize, area.height as usize);
         let mid_y = canvas.px_h as f64 / 2.0;
 
+        let mp = self.morph_progress; // 0=recording, 1=transcribing
+
         let pulse = ((self.t * 2.5).sin() * 0.5 + 0.5) * 0.35;
-        let energy = pulse + self.pulse_boost * 0.3;
+        let trans_energy = pulse + self.pulse_boost * 0.3;
+        // Blend energy: recording energy fades into transcribing pulse
+        let energy = self.morph_from_energy * (1.0 - mp) + trans_energy * mp;
 
         let breath = WAVEFORM_BREATH_MIN + WAVEFORM_BREATH_RANGE * (self.t * 0.5).sin();
-        let amp = breath * mid_y * 0.45 * (0.6 + energy * 0.5);
+        let trans_amp = breath * mid_y * 0.45 * (0.6 + trans_energy * 0.5);
+        let rec_amp = {
+            let base = breath * mid_y * 0.65;
+            base + self.morph_from_energy * WAVEFORM_ENERGY_BOOST * mid_y * 0.4
+        };
+        let amp = rec_amp * (1.0 - mp) + trans_amp * mp;
 
-        // Scan-line position
+        // Scan-line fades in with morph
         let scan_pos = (self.tick % SCANLINE_PERIOD) as f64 / SCANLINE_PERIOD as f64;
 
-        // Single flowing wave with scan-line brightening
+        // Recording-style colors (blue→cyan multi-layer)
+        let rec_colors: [(Color, Color, f64); 3] = [
+            (BLUE, Color::Rgb(40, 180, 255), 1.0),
+            (PINK, Color::Rgb(255, 100, 160), 0.45),
+            (Color::Rgb(40, 200, 170), Color::Rgb(80, 255, 210), 0.3),
+        ];
+
         for px in 0..canvas.px_w {
             let norm_x = px as f64 / canvas.px_w as f64;
 
-            // Scan-line proximity → brightness boost
+            // Scan-line proximity (fades in with morph)
             let scan_dist = (norm_x - scan_pos).abs();
-            let scan_glow = (1.0 - (scan_dist * 6.0).min(1.0)).max(0.0);
-            let brightness = 0.4 + scan_glow * 0.6;
+            let scan_glow = (1.0 - (scan_dist * 6.0).min(1.0)).max(0.0) * mp;
 
-            let color = lerp_color(
+            let trans_color = lerp_color(
                 Color::Rgb(8, 90, 180),
                 Color::Rgb(60, 200, 255),
                 scan_glow,
             );
+            let trans_brightness = 0.4 + scan_glow * 0.6;
 
             for (li, layer) in WAVE_LAYERS.iter().enumerate() {
-                let layer_dim = [1.0, 0.3, 0.15][li];
                 let y = wave_y(norm_x, self.t, layer, energy * 0.3);
                 let py = mid_y - y * amp * layer.amplitude;
-                let thickness = if li == 0 { 1.5 } else { 0.8 };
-                canvas.plot_curve(px as f64, py, color, brightness * layer_dim, thickness);
+
+                // Blend recording and transcribing styles
+                let (rec_l, rec_r, rec_int) = &rec_colors[li];
+                let rec_color = lerp_color(*rec_l, *rec_r, norm_x);
+                let rec_thick = if li == 0 {
+                    1.8 + self.morph_from_energy * 2.5
+                } else {
+                    1.0 + self.morph_from_energy * 0.8
+                };
+
+                let trans_layer_dim = [1.0, 0.3, 0.15][li];
+                let trans_thick = if li == 0 { 1.5 } else { 0.8 };
+
+                let color = lerp_color(rec_color, trans_color, mp);
+                let intensity =
+                    rec_int * (1.0 - mp) + trans_brightness * trans_layer_dim * mp;
+                let thickness = rec_thick * (1.0 - mp) + trans_thick * mp;
+
+                canvas.plot_curve(px as f64, py, color, intensity, thickness);
             }
         }
 
-        // Wider glow around scan-line
-        let scan_px = (scan_pos * canvas.px_w as f64) as i32;
-        for py in 0..canvas.px_h {
-            let norm_y = py as f64 / canvas.px_h as f64;
-            let edge_fade = (norm_y * std::f64::consts::PI).sin(); // dim at top/bottom
-            for dx in -6i32..=6 {
-                let px = scan_px + dx;
-                if px >= 0 && px < canvas.px_w as i32 {
-                    let dist = dx.unsigned_abs() as f64;
-                    let glow = (-dist * dist / 12.0).exp() * 0.15 * edge_fade;
-                    if glow > 0.01 {
-                        let idx = py * canvas.px_w + px as usize;
-                        canvas.brightness[idx] = (canvas.brightness[idx] + glow).min(1.0);
-                        canvas.color_r[idx] += 0.15 * glow;
-                        canvas.color_g[idx] += 0.55 * glow;
-                        canvas.color_b[idx] += 1.0 * glow;
+        // Wider glow around scan-line (fades in)
+        if mp > 0.1 {
+            let scan_px = (scan_pos * canvas.px_w as f64) as i32;
+            for py in 0..canvas.px_h {
+                let norm_y = py as f64 / canvas.px_h as f64;
+                let edge_fade = (norm_y * std::f64::consts::PI).sin();
+                for dx in -6i32..=6 {
+                    let px = scan_px + dx;
+                    if px >= 0 && px < canvas.px_w as i32 {
+                        let dist = dx.unsigned_abs() as f64;
+                        let glow = (-dist * dist / 12.0).exp() * 0.15 * edge_fade * mp;
+                        if glow > 0.01 {
+                            let idx = py * canvas.px_w + px as usize;
+                            canvas.brightness[idx] =
+                                (canvas.brightness[idx] + glow).min(1.0);
+                            canvas.color_r[idx] += 0.15 * glow;
+                            canvas.color_g[idx] += 0.55 * glow;
+                            canvas.color_b[idx] += 1.0 * glow;
+                        }
                     }
                 }
             }
@@ -328,18 +395,19 @@ impl Widget for &IdleWave {
         let breath = WAVEFORM_IDLE_BREATH_MIN + WAVEFORM_IDLE_BREATH_RANGE * (self.t * 0.4).sin();
         let amp = breath * mid_y * 0.35;
 
-        // Single gentle wave
-        let color = Color::Rgb(50, 55, 75);
-        let color_center = Color::Rgb(70, 80, 110);
+        // Slow color cycling — hue drifts over time
+        let hue_t = (self.t * 0.08).sin() * 0.5 + 0.5; // 0..1 slowly
+        let color_edge = lerp_color(Color::Rgb(50, 55, 75), Color::Rgb(60, 45, 80), hue_t);
+        let color_center = lerp_color(Color::Rgb(70, 80, 110), Color::Rgb(90, 65, 130), hue_t);
 
+        // Primary wave
         for px in 0..canvas.px_w {
             let norm_x = px as f64 / canvas.px_w as f64;
             let taper = (norm_x * std::f64::consts::PI).sin();
             let taper = taper * taper;
 
-            // Gradient: brighter at center
             let center_dist = (norm_x - 0.5).abs() * 2.0;
-            let c = lerp_color(color_center, color, center_dist);
+            let c = lerp_color(color_center, color_edge, center_dist);
 
             let y = (norm_x * std::f64::consts::TAU * 1.5 + self.t * 0.6).sin();
             let py = mid_y - y * amp * taper;
@@ -347,13 +415,54 @@ impl Widget for &IdleWave {
             canvas.plot_curve(px as f64, py, c, 0.7, 1.2);
         }
 
-        // Soft glow around center of wave
+        // Secondary wave — counter-moving, fainter, warmer
+        let amp2 = amp * 0.5;
+        let color2 = lerp_color(Color::Rgb(55, 40, 60), Color::Rgb(40, 55, 65), hue_t);
+        for px in 0..canvas.px_w {
+            let norm_x = px as f64 / canvas.px_w as f64;
+            let taper = (norm_x * std::f64::consts::PI).sin();
+            let taper = taper * taper;
+
+            let y = (norm_x * std::f64::consts::TAU * 2.2 - self.t * 0.4 + 1.8).sin();
+            let py = mid_y - y * amp2 * taper;
+
+            canvas.plot_curve(px as f64, py, color2, 0.35, 1.0);
+        }
+
+        // Soft glow around center of primary wave
         for px in (0..canvas.px_w).step_by(3) {
             let norm_x = px as f64 / canvas.px_w as f64;
             let taper = (norm_x * std::f64::consts::PI).sin();
             let y = (norm_x * std::f64::consts::TAU * 1.5 + self.t * 0.6).sin();
             let py = mid_y - y * amp * taper * taper;
-            canvas.plot_curve(px as f64, py, Color::Rgb(40, 45, 65), 0.15, 3.5);
+            let glow_color = lerp_color(Color::Rgb(40, 45, 65), Color::Rgb(50, 35, 60), hue_t);
+            canvas.plot_curve(px as f64, py, glow_color, 0.15, 3.5);
+        }
+
+        // Ambient floating particles — dust motes drifting slowly
+        let num_particles = 12u64;
+        for i in 0..num_particles {
+            // Each particle has a unique slow orbit
+            let seed = i.wrapping_mul(7919);
+            let base_x = (seed % 1000) as f64 / 1000.0;
+            let base_y = ((seed / 1000) % 1000) as f64 / 1000.0;
+            let speed_x = 0.015 + (seed % 17) as f64 * 0.002;
+            let speed_y = 0.008 + (seed % 13) as f64 * 0.001;
+            let phase = (seed % 31) as f64 * 0.2;
+
+            let px = ((base_x + self.t * speed_x + phase).sin() * 0.4 + 0.5) * canvas.px_w as f64;
+            let py = ((base_y + self.t * speed_y + phase * 1.3).sin() * 0.35 + 0.5)
+                * canvas.px_h as f64;
+
+            // Twinkle: slow brightness oscillation
+            let twinkle = ((self.t * 0.3 + phase * 2.0).sin() * 0.5 + 0.5) * 0.3 + 0.1;
+            let particle_color = lerp_color(
+                Color::Rgb(45, 50, 70),
+                Color::Rgb(65, 55, 85),
+                hue_t,
+            );
+
+            canvas.plot_curve(px, py, particle_color, twinkle, 0.5);
         }
 
         canvas.render_to(area, buf, 0.10);

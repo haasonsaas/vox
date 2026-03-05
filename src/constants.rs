@@ -25,6 +25,12 @@ pub const TICK_RATE_MS: u64 = 33; // ~30fps
 // ─── Transition timing ────────────────────────────────────
 pub const TRANSITION_FADE_IN_TICKS: u64 = 10;
 pub const TRANSITION_PULSE_TICKS: u64 = 3;
+pub const TYPEWRITER_CHARS_PER_TICK: usize = 3;
+pub const WAVEFORM_MORPH_TICKS: u64 = 20;
+
+// ─── Voice activity detection ────────────────────────────
+pub const VAD_ENERGY_THRESHOLD: f64 = 0.04;
+pub const DEFAULT_SILENCE_TIMEOUT_SECS: f32 = 0.0; // 0 = disabled
 
 // ─── Audio model ──────────────────────────────────────────
 pub const MIN_DURATION_SECONDS: f32 = 1.0;

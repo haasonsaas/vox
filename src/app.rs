@@ -47,6 +47,19 @@ pub struct AppState {
     // Transient flash message (e.g. "saved vox_20260302.txt")
     pub flash_message: Option<String>,
     pub flash_tick: u64,
+
+    // Don't persist history to disk
+    pub no_history: bool,
+
+    // Auto-copy to clipboard
+    pub auto_copy: bool,
+
+    // Waveform morph: energy at the moment recording ended
+    pub transition_energy: f64,
+
+    // Voice activity detection: consecutive low-energy ticks
+    pub silence_ticks: u64,
+    pub silence_timeout_ticks: u64, // 0 = disabled
 }
 
 const FLASH_DURATION_TICKS: u64 = 60; // ~2 seconds at 30fps
@@ -67,6 +80,11 @@ impl AppState {
             last_recording: None,
             flash_message: None,
             flash_tick: 0,
+            no_history: false,
+            auto_copy: false,
+            transition_energy: 0.0,
+            silence_ticks: 0,
+            silence_timeout_ticks: 0,
         }
     }
 

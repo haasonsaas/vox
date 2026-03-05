@@ -52,6 +52,18 @@ struct Cli {
     /// One-shot mode: record once, print transcription to stdout, exit
     #[arg(long)]
     oneshot: bool,
+
+    /// Clear history before starting
+    #[arg(long)]
+    clear_history: bool,
+
+    /// Don't load or save history
+    #[arg(long)]
+    no_history: bool,
+
+    /// Auto-stop recording after N seconds of silence (0 = disabled)
+    #[arg(long, default_value_t = constants::DEFAULT_SILENCE_TIMEOUT_SECS)]
+    silence_timeout: f32,
 }
 
 struct ResolvedAuth {
@@ -186,7 +198,20 @@ async fn run_app(
     auth: &ResolvedAuth,
 ) -> Result<AppState, Box<dyn std::error::Error>> {
     let mut state = AppState::new(auth.source.clone());
-    state.history = load_history();
+    state.no_history = cli.no_history;
+    state.auto_copy = cli.clipboard;
+    if cli.silence_timeout > 0.0 {
+        state.silence_timeout_ticks =
+            (cli.silence_timeout / (TICK_RATE_MS as f32 / 1000.0)) as u64;
+    }
+    if cli.clear_history {
+        if let Some(path) = history_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    if !cli.no_history && !cli.clear_history {
+        state.history = load_history();
+    }
 
     let mut capture: Option<audio::VoiceCapture> = None;
     let mut record_start: Option<Instant> = None;
@@ -221,7 +246,9 @@ async fn run_app(
                         }
                     }
                     state.history.push(text.clone());
-                    save_history(&state.history);
+                    if !state.no_history {
+                        save_history(&state.history);
+                    }
                     state.set_mode(Mode::Result { text, copied });
                 }
                 StreamEvent::Error(message) => {
@@ -332,55 +359,48 @@ async fn run_app(
                                 }
                             }
                         }
+                        KeyCode::Char('x') => {
+                            // Delete selected history entry
+                            if let Some(i) = state.history_selected {
+                                if i < state.history.len() {
+                                    state.history.remove(i);
+                                    if !state.no_history {
+                                        save_history(&state.history);
+                                    }
+                                    if state.history.is_empty() {
+                                        state.history_selected = None;
+                                    } else if i >= state.history.len() {
+                                        state.history_selected =
+                                            Some(state.history.len() - 1);
+                                    }
+                                    state.flash("deleted".to_string());
+                                }
+                            }
+                        }
+                        KeyCode::Char('X') => {
+                            // Clear all history
+                            if !state.history.is_empty() {
+                                state.history.clear();
+                                state.history_selected = None;
+                                if !state.no_history {
+                                    save_history(&state.history);
+                                }
+                                state.flash("history cleared".to_string());
+                            }
+                        }
                         _ => {}
                     },
                     Mode::Recording { .. } => match key.code {
                         KeyCode::Char(' ') => {
-                            // Stop recording and start transcription
-                            let recorded = capture
-                                .take()
-                                .ok_or_else(|| {
-                                    VoxError::Audio("no capture in progress".to_string())
-                                })?
-                                .stop()?;
-                            let duration = audio::clip_duration_seconds(&recorded);
-                            state.set_mode(Mode::Transcribing {
-                                duration_secs: duration,
-                                partial_text: String::new(),
-                            });
-                            record_start = None;
-
-                            state.last_recording = Some(audio::RecordedAudio {
-                                data: recorded.data.clone(),
-                                sample_rate: recorded.sample_rate,
-                                channels: recorded.channels,
-                            });
-
-                            // Spawn non-blocking transcription task
-                            let tx = tx.clone();
-                            let api_key = auth.api_key.clone();
-                            let api_base = auth.api_base.clone();
-                            let organization = auth.organization.clone();
-                            let project = auth.project.clone();
-                            let account_id = auth.account_id.clone();
-                            let context = cli.context.clone();
-                            tokio::spawn(async move {
-                                let result = transcribe::transcribe(
-                                    recorded,
-                                    &api_key,
-                                    &api_base,
-                                    organization.as_deref(),
-                                    project.as_deref(),
-                                    account_id.as_deref(),
-                                    context.as_deref(),
-                                )
-                                .await;
-                                let event = match result {
-                                    Ok(text) => StreamEvent::Done(text),
-                                    Err(e) => StreamEvent::Error(e.to_string()),
-                                };
-                                let _ = tx.send(event).await;
-                            });
+                            stop_and_transcribe(
+                                &mut state,
+                                &mut capture,
+                                &mut record_start,
+                                &env,
+                                &tx,
+                                auth,
+                                cli,
+                            )?;
                         }
                         KeyCode::Esc => {
                             // Cancel recording without transcribing
@@ -499,6 +519,29 @@ async fn run_app(
                         duration_secs: duration,
                         energy: env,
                     };
+
+                    // VAD: track silence and auto-stop
+                    if state.silence_timeout_ticks > 0 {
+                        if env < VAD_ENERGY_THRESHOLD {
+                            state.silence_ticks += 1;
+                        } else {
+                            state.silence_ticks = 0;
+                        }
+                        // Only auto-stop after at least MIN_DURATION_SECONDS of recording
+                        if state.silence_ticks >= state.silence_timeout_ticks
+                            && duration >= MIN_DURATION_SECONDS
+                        {
+                            stop_and_transcribe(
+                                &mut state,
+                                &mut capture,
+                                &mut record_start,
+                                &env,
+                                &tx,
+                                auth,
+                                cli,
+                            )?;
+                        }
+                    }
                 }
             }
 
@@ -522,6 +565,7 @@ fn start_recording(
             *capture = Some(c);
             *record_start = Some(Instant::now());
             *env = 0.0;
+            state.silence_ticks = 0;
             state.set_mode(Mode::Recording {
                 duration_secs: 0.0,
                 energy: 0.0,
@@ -533,6 +577,60 @@ fn start_recording(
             });
         }
     }
+}
+
+fn stop_and_transcribe(
+    state: &mut AppState,
+    capture: &mut Option<audio::VoiceCapture>,
+    record_start: &mut Option<Instant>,
+    env: &f64,
+    tx: &mpsc::Sender<StreamEvent>,
+    auth: &ResolvedAuth,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let recorded = capture
+        .take()
+        .ok_or_else(|| VoxError::Audio("no capture in progress".to_string()))?
+        .stop()?;
+    let duration = audio::clip_duration_seconds(&recorded);
+
+    // Capture energy for morph animation
+    state.transition_energy = *env;
+
+    state.set_mode(Mode::Transcribing {
+        duration_secs: duration,
+        partial_text: String::new(),
+    });
+    *record_start = None;
+
+    state.last_recording = Some(audio::RecordedAudio {
+        data: recorded.data.clone(),
+        sample_rate: recorded.sample_rate,
+        channels: recorded.channels,
+    });
+
+    // Spawn streaming transcription task
+    let tx = tx.clone();
+    let api_key = auth.api_key.clone();
+    let api_base = auth.api_base.clone();
+    let organization = auth.organization.clone();
+    let project = auth.project.clone();
+    let account_id = auth.account_id.clone();
+    let context = cli.context.clone();
+    tokio::spawn(async move {
+        transcribe::transcribe_streaming(
+            recorded,
+            &api_key,
+            &api_base,
+            organization.as_deref(),
+            project.as_deref(),
+            account_id.as_deref(),
+            context.as_deref(),
+            tx,
+        )
+        .await;
+    });
+    Ok(())
 }
 
 // ─── Auth resolution ────────────────────────────────────────

@@ -68,9 +68,31 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
         }
     };
 
+    // Mode accent dot — reflects current state with subtle animation
+    let (dot_char, dot_color) = match &state.mode {
+        Mode::Idle => {
+            let dim = 0.3 + 0.15 * (state.tick as f64 * 0.04).sin();
+            ("◦", dim_color(Color::Rgb(80, 85, 100), dim))
+        }
+        Mode::Recording { .. } => {
+            let pulse_t = (state.tick as f64 * 0.15).sin() * 0.5 + 0.5;
+            ("●", lerp_color(Color::Rgb(180, 40, 35), RED_PULSE, pulse_t))
+        }
+        Mode::Transcribing { .. } => {
+            let pulse_t = (state.tick as f64 * 0.1).sin() * 0.5 + 0.5;
+            ("◉", lerp_color(Color::Rgb(8, 90, 180), BLUE, pulse_t))
+        }
+        Mode::Result { .. } => ("◉", GREEN),
+        Mode::Error { .. } => ("◉", RED_PULSE),
+    };
+
     let title = vec![
         Span::styled(
-            " v",
+            format!(" {dot_char} "),
+            Style::default().fg(dot_color),
+        ),
+        Span::styled(
+            "v",
             Style::default()
                 .fg(dim_color(BLUE, pulse(0.0)))
                 .add_modifier(Modifier::BOLD),
@@ -93,7 +115,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
     let hint = match state.mode {
         Mode::Idle => {
             if state.history_selected.is_some() {
-                "enter copy  esc deselect"
+                "enter copy  x del  X clear  esc deselect"
             } else {
                 "space record  d device  q quit"
             }
@@ -156,10 +178,19 @@ fn draw_waveform(f: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 0.0
             };
+            let morph_progress = if age < WAVEFORM_MORPH_TICKS {
+                age as f64 / WAVEFORM_MORPH_TICKS as f64
+            } else {
+                1.0
+            };
+            // Smooth easing (ease-in-out)
+            let morph_progress = morph_progress * morph_progress * (3.0 - 2.0 * morph_progress);
             let tw = TranscribingWave {
                 t: state.tick as f64 * WAVEFORM_TRANSCRIBING_TIME_SCALE,
                 tick: state.tick,
                 pulse_boost,
+                morph_from_energy: state.transition_energy,
+                morph_progress,
             };
             f.render_widget(&tw, inner);
         }
@@ -176,12 +207,21 @@ fn draw_waveform(f: &mut Frame, area: Rect, state: &AppState) {
 fn draw_result_text(f: &mut Frame, area: Rect, state: &AppState) {
     if let Mode::Result { ref text, .. } = state.mode {
         let age = state.transition_age();
+
+        // Typewriter reveal: characters appear progressively
+        let max_chars = if age < (text.chars().count() / TYPEWRITER_CHARS_PER_TICK + TRANSITION_FADE_IN_TICKS as usize) as u64 {
+            (age as usize * TYPEWRITER_CHARS_PER_TICK).min(text.chars().count())
+        } else {
+            text.chars().count()
+        };
+        let revealed: String = text.chars().take(max_chars).collect();
+        let fully_revealed = max_chars >= text.chars().count();
+
         let alpha = if age < TRANSITION_FADE_IN_TICKS {
             age as f64 / TRANSITION_FADE_IN_TICKS as f64
         } else {
             1.0
         };
-        let text_color = lerp_color(SURFACE, TEXT, alpha);
 
         // Center text vertically if it fits in the area
         let inner = Rect {
@@ -191,21 +231,37 @@ fn draw_result_text(f: &mut Frame, area: Rect, state: &AppState) {
             height: area.height.saturating_sub(1),
         };
 
-        // Accent line on the left
+        // Accent line on the left — grows with reveal, subtle gradient
         if inner.height > 0 && inner.x > area.x + 1 {
             let accent_x = area.x + 1;
-            for row in 0..inner.height.min(3) {
+            let accent_height = if fully_revealed {
+                inner.height.min(3)
+            } else {
+                inner.height.min(3).min((age as u16 / 2).max(1))
+            };
+            for row in 0..accent_height {
                 if accent_x < area.x + area.width && (inner.y + row) < area.y + area.height {
+                    let row_t = row as f64 / accent_height.max(1) as f64;
+                    let accent_color = lerp_color(GREEN, Color::Rgb(30, 140, 120), row_t);
                     let cell =
                         &mut f.buffer_mut()[(accent_x, inner.y + row)];
                     cell.set_char('│');
-                    cell.set_fg(dim_color(GREEN, alpha * 0.5));
+                    cell.set_fg(dim_color(accent_color, alpha * 0.6));
                 }
             }
         }
 
-        let para = Paragraph::new(text.as_str())
-            .style(Style::default().fg(text_color).bg(SURFACE))
+        // Build styled text: revealed chars in full color, cursor blink at end
+        let text_color = lerp_color(SURFACE, TEXT, alpha);
+        let mut spans = vec![Span::styled(&revealed, Style::default().fg(text_color))];
+
+        // Blinking cursor at the typing edge (while still revealing)
+        if !fully_revealed && (age / 4) % 2 == 0 {
+            spans.push(Span::styled("▎", Style::default().fg(dim_color(GREEN, 0.6))));
+        }
+
+        let para = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(SURFACE))
             .wrap(Wrap { trim: false })
             .scroll((state.result_scroll, 0));
         f.render_widget(para, inner);
@@ -228,10 +284,23 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
 
     let spans = match &state.mode {
         Mode::Idle => {
-            vec![
+            let mut spans = vec![
                 Span::styled(" ○ ", Style::default().fg(Color::Rgb(55, 55, 65))),
                 Span::styled("ready", Style::default().fg(Color::Rgb(80, 80, 95))),
-            ]
+            ];
+            if state.auto_copy {
+                spans.push(Span::styled(
+                    "  ⎘ auto-copy",
+                    Style::default().fg(Color::Rgb(45, 45, 55)),
+                ));
+            }
+            if state.silence_timeout_ticks > 0 {
+                spans.push(Span::styled(
+                    "  ◇ vad",
+                    Style::default().fg(Color::Rgb(45, 45, 55)),
+                ));
+            }
+            spans
         }
         Mode::Recording {
             duration_secs,
@@ -293,16 +362,26 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             }
             spans
         }
-        Mode::Result { copied: true, .. } => {
+        Mode::Result { ref text, copied: true } => {
+            let words = text.split_whitespace().count();
             vec![
                 Span::styled(" ✓ ", Style::default().fg(GREEN)),
                 Span::styled("copied to clipboard", Style::default().fg(Color::Rgb(80, 80, 95))),
+                Span::styled(
+                    format!("  {words} words"),
+                    Style::default().fg(Color::Rgb(55, 55, 65)),
+                ),
             ]
         }
-        Mode::Result { .. } => {
+        Mode::Result { ref text, .. } => {
+            let words = text.split_whitespace().count();
             vec![
                 Span::styled(" ✓ ", Style::default().fg(GREEN)),
                 Span::styled("done", Style::default().fg(Color::Rgb(80, 80, 95))),
+                Span::styled(
+                    format!("  {words} words"),
+                    Style::default().fg(Color::Rgb(55, 55, 65)),
+                ),
             ]
         }
         Mode::Error { ref message } => {
@@ -327,13 +406,17 @@ fn draw_history(f: &mut Frame, area: Rect, state: &AppState) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Thin divider
+    // Gradient-fading divider
     let divider_width = area.width.min(30) as usize;
-    let divider: String = "─".repeat(divider_width);
-    lines.push(Line::from(Span::styled(
-        format!(" {divider}"),
-        Style::default().fg(Color::Rgb(35, 35, 42)),
-    )));
+    let divider_spans: Vec<Span> = std::iter::once(Span::raw(" "))
+        .chain((0..divider_width).map(|i| {
+            let t = i as f64 / divider_width as f64;
+            let fade = 1.0 - t; // fades from left to right
+            let c = dim_color(Color::Rgb(50, 55, 65), fade * 0.7 + 0.15);
+            Span::styled("─", Style::default().fg(c))
+        }))
+        .collect();
+    lines.push(Line::from(divider_spans));
 
     let visible_count = (area.height as usize).saturating_sub(1); // -1 for divider
     let entries: Vec<_> = state
